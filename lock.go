@@ -89,6 +89,12 @@ func LockPIDFile(name string) (*os.File, error) {
 		fmt.Fprintf(lockFile, "%d\n", os.Getpid())
 		lockFile.Sync()
 
+		// 防孤儿持锁：设置 close-on-exec，防止 PID 锁 fd 被 exec 的子进程继承。
+		// 网关运行中会 spawn 工具子进程（bash/wsprun/ws-approve 等），若子进程
+		// 继承 flock 锁 fd，父进程退出后若子进程仍在运行（PPID=1 孤儿），锁被长期
+		// 占用 → 下次启动报「已在运行」。所有使用本库的网关统一受益。
+		syscall.CloseOnExec(int(lockFile.Fd()))
+
 		return lockFile, nil
 	}
 
