@@ -25,6 +25,8 @@ func TestParseTaskCommand_Hits(t *testing.T) {
 		{"1000 pause", 1000, "暂停", false},
 		{"1000 停止", 1000, "停止", false},
 		{"1000 取消", 1000, "取消", false},
+		{"1000 重试", 1000, "重试", false},
+		{"1000 retry", 1000, "重试", false},
 		{"1000 删除", 1000, "删除", false},
 		{"1000 确认删除", 1000, "删除", true},
 		{"1000 详情", 1000, "详情", false},
@@ -253,6 +255,8 @@ func TestCommand_NormalizesUserVerbs(t *testing.T) {
 		{"rm", "删除", false},
 		{"确认删除", "删除", true},
 		{"confirm-delete", "删除", true},
+		{"retry", "重试", false},
+		{"重试", "重试", false},
 		{"PAUSE", "暂停", false}, // 大小写
 		{" 停止 ", "停止", false},  // 前后空白
 	}

@@ -205,7 +205,7 @@ func (h *TaskHub) Get(short int) (*HubTask, error) {
 	return &t, nil
 }
 
-// Command 向中枢下发指令（继续/暂停/停止/取消/删除）。
+// Command 向中枢下发指令（继续/暂停/停止/取消/重试/删除）。
 // 返回中枢给用户的可读结果文本（删除未确认时是"请二次确认"提示）。
 //
 // 入参 cmd **接受用户原话**（中文/英文别名均可，如 "pause"/"确认删除"/"rm"），
@@ -220,7 +220,7 @@ func (h *TaskHub) Command(short int, cmd string, confirm bool) (string, error) {
 	raw := strings.ToLower(strings.TrimSpace(cmd))
 	verb := NormalizeTaskHubVerb(raw)
 	if verb == "" {
-		return "", fmt.Errorf("未知指令 %q（可选：继续/暂停/停止/取消/删除）", cmd)
+		return "", fmt.Errorf("未知指令 %q（可选：继续/暂停/停止/取消/重试/删除）", cmd)
 	}
 	if verb == "详情" {
 		return "", fmt.Errorf("「详情」是本地查询动作，请用 Get(short) 获取详情")
@@ -329,6 +329,7 @@ var taskHubVerbAliases = map[string]string{
 	"暂停": "暂停", "pause": "暂停", "hold": "暂停",
 	"停止": "停止", "stop": "停止",
 	"取消": "取消", "cancel": "取消", "abort": "取消",
+	"重试": "重试", "retry": "重试", "重跑": "重试", "rerun": "重试",
 	"删除": "删除", "delete": "删除", "remove": "删除", "rm": "删除",
 }
 
@@ -480,8 +481,8 @@ func TaskCommandHint(tasks []HubTask) string {
 	}
 	var sb strings.Builder
 	sb.WriteString("回复：`<编号> <指令>`，例如：\n")
-	sb.WriteString(fmt.Sprintf("  `%d 继续` / `%d 暂停` / `%d 停止` / `%d 取消` / `%d 删除`\n",
-		n, n, n, n, n))
+	sb.WriteString(fmt.Sprintf("  `%d 继续` / `%d 暂停` / `%d 停止` / `%d 取消` / `%d 重试` / `%d 删除`\n",
+		n, n, n, n, n, n))
 	sb.WriteString(fmt.Sprintf("  `%d 详情` 查看单个任务；`%d 确认删除` 二次确认删除", n, n))
 	return sb.String()
 }
@@ -521,6 +522,89 @@ func FormatTaskDetail(t *HubTask) string {
 	sb.WriteString("\n")
 	sb.WriteString(TaskCommandHint([]HubTask{*t}))
 	return sb.String()
+}
+
+// ── 上线统一播报（任务清单 + 中断对话合并）──
+
+// InterruptedSession 一条"网关重启时中断的对话处理"的渠道无关视图。
+//
+// 各网关从本地 processing 队列（qq_processing_*.json）转换而来——共享组件
+// **不依赖具体渠道的持久化类型**，只吃这个中性结构。这样 6 个网关共用同一份
+// 渲染逻辑，体验一致。
+type InterruptedSession struct {
+	Summary  string // 用户消息摘要
+	TaskID   string // 会话任务 ID（可空）
+	Step     int    // 当前步骤序号（1 起；0 = 无断点）
+	StepName string // 当前步骤名
+}
+
+// Line 渲染一条中断对话的摘要行（含断点步骤）。
+func (it InterruptedSession) Line() string {
+	s := strings.TrimSpace(it.Summary)
+	if s == "" {
+		s = "（消息内容为空）"
+	}
+	if it.StepName != "" {
+		s += fmt.Sprintf("（第 %d 步：%s）", it.Step, it.StepName)
+	} else if it.Step > 0 {
+		s += fmt.Sprintf("（第 %d 步）", it.Step)
+	}
+	return s
+}
+
+// FormatStartupTasks 渲染"上线统一播报"：把【中枢活跃任务清单】与
+// 【上次重启时中断的对话】**合并为一条消息**（全体对话网关复用）。
+//
+// 为什么要合并：此前网关重启会连发两条——
+//  1. "🔄 检测到上次中断的任务：…"（本地 processing 队列，各网关自己发）
+//  2. "📋 任务清单（N 个活跃任务）"（任务中枢，taskhub 发）
+//
+// 两条语义相邻、用户要读两遍；合并后只发一条，中断对话作为清单的一个小节。
+//
+// 参数：
+//   - tasks：中枢活跃任务（可为空）
+//   - fromSnapshot：tasks 是否来自本地快照（中枢暂不可达）
+//   - interrupted：本次中断的对话（可为空）
+//   - autoResume：true = 网关会自行恢复（wecom/feishu/telegram）；
+//     false = 需用户回复「继续」/「取消」确认（qq/weixin）
+//
+// 返回空串表示"无内容可播报"，调用方据此跳过发送（网关重启频繁，空播报=骚扰）。
+func FormatStartupTasks(tasks []HubTask, fromSnapshot bool, interrupted []InterruptedSession, autoResume bool) string {
+	if len(tasks) == 0 && len(interrupted) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	switch {
+	case fromSnapshot:
+		sb.WriteString(fmt.Sprintf("📋 **任务清单**（⚠️ 任务中枢暂不可达，以下为本地快照，含 %d 个活跃任务）\n\n", len(tasks)))
+	case len(tasks) > 0:
+		sb.WriteString(fmt.Sprintf("📋 **任务清单**（%d 个活跃任务）\n\n", len(tasks)))
+	default:
+		sb.WriteString("📋 **任务清单**（当前无活跃任务）\n\n")
+	}
+	for _, t := range tasks {
+		sb.WriteString(FormatTaskLine(t))
+		sb.WriteString("\n")
+	}
+	if len(interrupted) > 0 {
+		sb.WriteString("\n")
+		if autoResume {
+			sb.WriteString(fmt.Sprintf("🔄 **另有 %d 条对话在上次重启时中断，正在自动恢复**：\n", len(interrupted)))
+		} else {
+			sb.WriteString(fmt.Sprintf("🔄 **另有 %d 条对话在上次重启时中断**（回复「继续」恢复处理 / 「取消」放弃）：\n", len(interrupted)))
+		}
+		for _, it := range interrupted {
+			sb.WriteString("  · ")
+			sb.WriteString(it.Line())
+			sb.WriteString("\n")
+		}
+	}
+	// 仅当有中枢任务时才给指令用法提示（无任务时提示无意义）。
+	if len(tasks) > 0 {
+		sb.WriteString("\n")
+		sb.WriteString(TaskCommandHint(tasks))
+	}
+	return strings.TrimRight(sb.String(), "\n")
 }
 
 // ── 小工具 ──
