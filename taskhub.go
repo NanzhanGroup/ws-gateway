@@ -587,7 +587,9 @@ func FormatStartupTasks(tasks []HubTask, fromSnapshot bool, interrupted []Interr
 		sb.WriteString("\n")
 	}
 	if len(interrupted) > 0 {
-		sb.WriteString("\n")
+		if len(tasks) > 0 {
+			sb.WriteString("\n")
+		}
 		if autoResume {
 			sb.WriteString(fmt.Sprintf("🔄 **另有 %d 条对话在上次重启时中断，正在自动恢复**：\n", len(interrupted)))
 		} else {
