@@ -13,7 +13,8 @@
 // 保证各渠道体验完全一致：
 //
 //	下线任务落盘（ws-core 侧）→ 上线网关给出【任务列表 + 状态】
-//	→ 用户回复 `<4 位任务 ID> <指令>` → 网关转中枢 → 回显结果
+//	→ 用户回复 `#<4 位任务 ID> <指令>#` → 网关转中枢 → 回显结果
+//	（删除需二次确认，回复 `##<4 位任务 ID> 删除##`）
 //
 // ── 设计要点 ──
 //
@@ -22,8 +23,11 @@
 //     "拉列表 / 记快照 / 格式化 / 解析指令 / 转指令"，由网关侧挂钩子；
 //  3. **快照兜底**：每次成功拉取都落盘快照，ws-core 短暂不可用时仍能列出
 //     "上次已知的任务清单"（标注为快照），实现"下线落盘、上线可列"；
-//  4. **解析从严**：必须"4 位数字 + 已知指令词"才拦截，绝不吞掉正常聊天
-//     （例如"2024 年的合同"不会命中，因为"年的合同"不是指令词）。
+//  4. **解析从严**：必须"# + 4 位数字 + 已知指令词 + #"**整串**匹配才拦截，
+//     绝不吞掉正常聊天（例如"2024 年的合同"不会命中；裸 `1000 删除` 也不再
+//     命中——无定界符一律放行给 LLM）；
+//  5. **二次确认**：删除用双井号 `##<编号> 删除##`，**一条消息自带确认**，
+//     中枢无需记"等待确认"状态（ws-core 的 confirm 本就无状态）。
 package gateway
 
 import (
@@ -319,8 +323,34 @@ func (h *TaskHub) LoadSnapshot() (*taskHubSnapshot, error) {
 
 // ── 指令解析 ──
 
-// 严格匹配：4 位数字 + 空白 + 指令词（整串匹配，防止 "1000 继续吧兄弟" 之类误吞）。
-var taskHubCmdRE = regexp.MustCompile(`^([0-9]{4})[\s:：,，]+(\S+)$`)
+// 指令定界符：`#<编号> <指令>#`；二次确认用双井号 `##<编号> <指令>##`。
+//
+// 为什么加定界符：无定界时靠"4 位数字 + 指令词"整串匹配，仍有极小概率撞上正常
+// 聊天（English `2000 stop`、正好在讨论数字 1000 的对话）。加定界后碰撞概率降为
+// 零；用户也能直接长按复制提示里的字面量，不必手打井号。
+//
+// 分组：1=前导井号串($1) 2=短号 3=指令词 4=尾部井号串；
+// 前导/尾部井号 **数量** 决定是否为二次确认（见 ParseTaskCommand）。
+var taskHubCmdRE = regexp.MustCompile(`^(#+)([0-9]{4})[\s:：,，]+([^\s#]+)(#+)$`)
+
+// taskHubFullWidReplacer 归一化手机中文键盘常出的全角字符，避免"看起来对却收不到"：
+//
+//	全角井号 ＃ → #（否则 `＃1000 继续＃` 不命中）
+//	全角数字 ０-９ → 0-9
+//	全角空格 　 → 半角空格（Go 正则 \s 只认 ASCII 空白）
+//
+// 仅做字符级等价替换，不改语义。全角冒号/逗号已在正则字符组内直接接受，无需替换。
+var taskHubFullWidReplacer = strings.NewReplacer(
+	"＃", "#",
+	"０", "0", "１", "1", "２", "2", "３", "3", "４", "4",
+	"５", "5", "６", "6", "７", "7", "８", "8", "９", "9",
+	"　", " ",
+)
+
+// normalizeTaskHubInput 归一化用户输入（全角 → 半角 + 去首尾空白）。
+func normalizeTaskHubInput(text string) string {
+	return strings.TrimSpace(taskHubFullWidReplacer.Replace(text))
+}
 
 // taskHubVerbAliases 指令别名表（中文/英文）→ 中枢标准指令词。
 // 值为空串表示"非指令词"，用于快速判定。
@@ -362,22 +392,36 @@ func NormalizeTaskHubVerb(word string) string {
 // IsTaskHubCommandVerb 是否为已知指令词（含详情/确认删除）。
 func IsTaskHubCommandVerb(word string) bool { return NormalizeTaskHubVerb(word) != "" }
 
-// ParseTaskCommand 解析用户回复。命中返回 (短号, 归一化指令, 是否需二次确认)。
-// ok=false 表示这不是任务指令，调用方应放行给正常对话流程。
+// ParseTaskCommand 解析用户回复的任务指令。
+//
+// 语法（**整串**匹配，命中才拦截）：
+//
+//	#<4 位编号> <指令>#      —— 普通指令，如 `#1000 继续#`
+//	##<4 位编号> <指令>##    —— 二次确认（仅「删除」有意义），如 `##1000 删除##`
+//
+// 返回 (短号, 归一化指令, 是否二次确认)。ok=false 表示这不是任务指令，调用方
+// 应放行给正常对话流程（**不执行、不提示**——本功能未正式上线，无需迁移提示）。
+//
+// 兼容与容错：
+//   - `#1000 确认删除#` 这类"确认"别名同样判为二次确认；
+//   - 双侧井号数量 ≥2 才算二次确认；单边不齐（如 `#1000 删除##`）按**普通**指令
+//     处理——方向是安全的：中枢会再要一次确认，**宁可多问一次，不误删**；
+//   - 全角 `＃`/数字/空格等价（手机中文键盘常见）。
 func ParseTaskCommand(text string) (short int, cmd string, confirm bool, ok bool) {
-	m := taskHubCmdRE.FindStringSubmatch(strings.TrimSpace(text))
+	m := taskHubCmdRE.FindStringSubmatch(normalizeTaskHubInput(text))
 	if m == nil {
 		return 0, "", false, false
 	}
-	verb := NormalizeTaskHubVerb(m[2])
+	verb := NormalizeTaskHubVerb(m[3])
 	if verb == "" {
-		return 0, "", false, false // 4 位数字后面不是指令词 → 不拦截
+		return 0, "", false, false // 井号内不是指令词 → 不拦截
 	}
-	n, err := strconv.Atoi(m[1])
+	n, err := strconv.Atoi(m[2])
 	if err != nil || ValidateShortNo(n) != nil {
 		return 0, "", false, false
 	}
-	_, confirm = taskHubConfirmAliases[strings.ToLower(strings.TrimSpace(m[2]))]
+	confirm = (len(m[1]) >= 2 && len(m[4]) >= 2) ||
+		taskHubConfirmAliases[strings.ToLower(strings.TrimSpace(m[3]))]
 	return n, verb, confirm, true
 }
 
@@ -473,17 +517,20 @@ func FormatTaskLine(t HubTask) string {
 	return line
 }
 
-// TaskCommandHint 指令用法提示（列示例短号，便于用户直接改数字回复）。
+// TaskCommandHint 指令用法提示（列示例短号，便于用户直接复制回复）。
+//
+// 字面量一律用行内代码包住：① 手机可长按复制，免去在符号页翻找 `#`；
+// ② 裸 `#` 在 Telegram 是 hashtag、在 Markdown 是标题符，包住即消歧。
 func TaskCommandHint(tasks []HubTask) string {
 	n := 1000
 	if len(tasks) > 0 {
 		n = tasks[0].ShortNo
 	}
 	var sb strings.Builder
-	sb.WriteString("回复：`<编号> <指令>`，例如：\n")
-	sb.WriteString(fmt.Sprintf("  `%d 继续` / `%d 暂停` / `%d 停止` / `%d 取消` / `%d 重试` / `%d 删除`\n",
+	sb.WriteString("回复：`#<编号> <指令>#`（前后各一个 `#`），例如：\n")
+	sb.WriteString(fmt.Sprintf("  `#%d 继续#` / `#%d 暂停#` / `#%d 停止#` / `#%d 取消#` / `#%d 重试#` / `#%d 详情#`\n",
 		n, n, n, n, n, n))
-	sb.WriteString(fmt.Sprintf("  `%d 详情` 查看单个任务；`%d 确认删除` 二次确认删除", n, n))
+	sb.WriteString(fmt.Sprintf("  删除需二次确认：先 `#%d 删除#`，再回复 `##%d 删除##`（前后各两个 `#`）", n, n))
 	return sb.String()
 }
 

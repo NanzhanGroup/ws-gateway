@@ -58,7 +58,7 @@ func TestFormatStartupTasks_TasksOnly(t *testing.T) {
 	if strings.Contains(out, "中断") {
 		t.Fatalf("无中断对话时不应出现中断小节: %q", out)
 	}
-	if !strings.Contains(out, "1000 继续") {
+	if !strings.Contains(out, "#1000 继续#") {
 		t.Fatalf("缺少指令用法提示: %q", out)
 	}
 }
