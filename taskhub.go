@@ -85,6 +85,18 @@ type HubTask struct {
 	CreatedAt       string `json:"created_at,omitempty"`
 	UpdatedAt       string `json:"updated_at,omitempty"`
 	Result          string `json:"result,omitempty"`
+	// ── 计划节点进度（见下方说明）──
+	//
+	// 节点（.wst 拆解出的执行明细）由 ws-core 存于**独立的 subtasks 表**，
+	// 不在 /api/tasks 清单里出现（结构隔离，见 ws-core/subtaskdb.go）——
+	// 因此它们只有一个可见处：**父任务的详情**。
+	//
+	// 这三个字段**只在 Get（按短号取详情）时**由 Nodes() 填充，清单/播报路径一律为空。
+	// 标 json:"-"：既不入快照文件，也不参与与中枢的接口序列化（避免与清单混淆）。
+	Nodes       []HubTask `json:"-"`
+	NodesTotal  int       `json:"-"`
+	NodesDone   int       `json:"-"`
+	NodesFailed int       `json:"-"`
 }
 
 // taskHubSnapshot 快照文件结构（落盘，供 ws-core 不可用时兜底）
@@ -206,7 +218,38 @@ func (h *TaskHub) Get(short int) (*HubTask, error) {
 	if err := json.Unmarshal(body, &t); err != nil {
 		return nil, fmt.Errorf("解析任务详情失败: %w", err)
 	}
+	// 计划任务（拆解过、有子步骤）→ 顺带展开「执行节点」进度。
+	// **只有详情路径做这件事**：清单/上线播报不带（几十上百个节点会淹掉清单，
+	// 这正是 0.12.0 要根治的问题）。取数失败静默降级（详情本身仍可用）。
+	if t.StepTotal > 0 {
+		if nodes, total, done, failed, err := h.Nodes(t.ID); err == nil {
+			t.Nodes, t.NodesTotal, t.NodesDone, t.NodesFailed = nodes, total, done, failed
+		}
+	}
 	return &t, nil
+}
+
+// Nodes 拉取某任务的计划节点进度（ws-core：GET /api/tasks/{id}/nodes）。
+//
+// 节点是**父任务内部的执行明细**，用户面清单从不列节点；需要细节时才展开 —— 这就是那个口子。
+func (h *TaskHub) Nodes(taskID int64) (nodes []HubTask, total, done, failed int, err error) {
+	if taskID <= 0 {
+		return nil, 0, 0, 0, fmt.Errorf("非法任务 id: %d", taskID)
+	}
+	body, err := h.get(fmt.Sprintf("%s/api/tasks/%d/nodes", h.BaseURL, taskID))
+	if err != nil {
+		return nil, 0, 0, 0, err
+	}
+	var resp struct {
+		Nodes  []HubTask `json:"nodes"`
+		Total  int       `json:"total"`
+		Done   int       `json:"done"`
+		Failed int       `json:"failed"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, 0, 0, 0, fmt.Errorf("解析节点进度失败: %w", err)
+	}
+	return resp.Nodes, resp.Total, resp.Done, resp.Failed, nil
 }
 
 // Command 向中枢下发指令（继续/暂停/停止/取消/重试/删除）。
@@ -554,7 +597,15 @@ func TaskCommandHint(tasks []HubTask) string {
 	return sb.String()
 }
 
+// TaskDetailMaxNodes 详情里最多列出的节点行数（超出折叠为一行计数）。
+// 取 12：手机上一屏内可读，又不至于把「哪个节点卡住」藏起来。
+const TaskDetailMaxNodes = 12
+
 // FormatTaskDetail 渲染单个任务详情。
+//
+// t.Nodes 非空时（Get 已填充）追加「执行节点」小节：先列**失败/中断**（最需要用户决策），
+// 再列在跑、待办，其余折叠。节点没有短号（是执行明细，不是用户的承诺），
+// 故用 `t37` 这样的计划内编号标识，而不是 `#1000`。
 func FormatTaskDetail(t *HubTask) string {
 	if t == nil {
 		return "未找到该任务。"
@@ -586,8 +637,62 @@ func FormatTaskDetail(t *HubTask) string {
 	if t.Goal != "" && t.Goal != t.Title {
 		sb.WriteString(fmt.Sprintf("\n> 目标：%s\n", truncateRunes(t.Goal, 300)))
 	}
+	sb.WriteString(formatDetailNodes(t))
 	sb.WriteString("\n")
 	sb.WriteString(TaskCommandHint([]HubTask{*t}))
+	return sb.String()
+}
+
+// formatDetailNodes 渲染「执行节点」小节（无节点时返回空串）。
+func formatDetailNodes(t *HubTask) string {
+	if t == nil || len(t.Nodes) == 0 {
+		return ""
+	}
+	total := t.NodesTotal
+	if total <= 0 {
+		total = len(t.Nodes)
+	}
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "\n**执行节点（%d/%d 完成", t.NodesDone, total)
+	if t.NodesFailed > 0 {
+		fmt.Fprintf(&sb, "，%d 失败", t.NodesFailed)
+	}
+	sb.WriteString("）**\n")
+
+	// 排序：失败/中断最需要用户决策 → 在跑 → 待办 → 已完成
+	rank := func(st string) int {
+		switch st {
+		case "failed", "interrupted":
+			return 0
+		case "running", "leased":
+			return 1
+		case "paused", "pending":
+			return 2
+		default:
+			return 3
+		}
+	}
+	sorted := make([]HubTask, len(t.Nodes))
+	copy(sorted, t.Nodes)
+	sort.SliceStable(sorted, func(i, j int) bool { return rank(sorted[i].Status) < rank(sorted[j].Status) })
+
+	shown := 0
+	for _, n := range sorted {
+		if shown >= TaskDetailMaxNodes {
+			break
+		}
+		label := strings.TrimSpace(n.TaskID)
+		if label == "" {
+			label = fmt.Sprintf("#%d", n.ID)
+		}
+		fmt.Fprintf(&sb, "  · %s `%s` %s\n", TaskStatusIcon(n.Status), label, truncateRunes(n.Title, 40))
+		shown++
+	}
+	// 折叠计数用**总数**（total），不是本次返回的条数：ws-core 可能只回传一段，
+	// 该提示要让用户知道「还有多少没列出来」。
+	if rest := total - shown; rest > 0 {
+		fmt.Fprintf(&sb, "  …另有 %d 个节点（完整清单：`GET /api/tasks/%d/nodes`）\n", rest, t.ID)
+	}
 	return sb.String()
 }
 
