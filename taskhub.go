@@ -502,9 +502,26 @@ func FormatTaskList(tasks []HubTask, fromSnapshot bool) string {
 	return sb.String()
 }
 
+// TaskLabel 渲染任务的用户可读编号（**唯一渲染契约**，与 ws-core 的 taskLabel 对齐）。
+//
+// 4 位短号（1000-9999）是用户交互资源，只有「用户的承诺」才持有；计划节点（.wst 拆解明细）
+// 由 ws-core 存在**独立的 subtasks 表**（见 ws-core/subtaskdb.go），根本不走 /api/tasks，
+// 因此网关拿不到节点行。此处的兜底是**第三道防线**：万一 short_no==0（历史数据/脏快照），
+// 也绝不输出 `#0` —— `#0` 不是合法短号（ValidateShortNo 只认 1000-9999），
+// 显示得像编号却点不进去，是纯粹的误导。
+func TaskLabel(t HubTask) string {
+	if t.ShortNo > 0 {
+		return fmt.Sprintf("#%d", t.ShortNo)
+	}
+	if t.TaskID != "" {
+		return t.TaskID
+	}
+	return fmt.Sprintf("task:%d", t.ID)
+}
+
 // FormatTaskLine 渲染单行任务。
 func FormatTaskLine(t HubTask) string {
-	line := fmt.Sprintf("%s `#%d` %s %s", TaskStatusIcon(t.Status), t.ShortNo,
+	line := fmt.Sprintf("%s `%s` %s %s", TaskStatusIcon(t.Status), TaskLabel(t),
 		TaskStatusLabelCN(t.Status), truncateRunes(t.Title, 48))
 	if t.Status == "running" || t.Status == "leased" || t.Status == "paused" || t.Status == "interrupted" {
 		if t.StepTotal > 0 {
@@ -523,8 +540,11 @@ func FormatTaskLine(t HubTask) string {
 // ② 裸 `#` 在 Telegram 是 hashtag、在 Markdown 是标题符，包住即消歧。
 func TaskCommandHint(tasks []HubTask) string {
 	n := 1000
-	if len(tasks) > 0 {
-		n = tasks[0].ShortNo
+	for _, t := range tasks {
+		if t.ShortNo > 0 {
+			n = t.ShortNo
+			break
+		}
 	}
 	var sb strings.Builder
 	sb.WriteString("回复：`#<编号> <指令>#`（前后各一个 `#`），例如：\n")
@@ -540,7 +560,7 @@ func FormatTaskDetail(t *HubTask) string {
 		return "未找到该任务。"
 	}
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("%s **#%d** %s\n\n", TaskStatusIcon(t.Status), t.ShortNo, truncateRunes(t.Title, 80)))
+	sb.WriteString(fmt.Sprintf("%s **%s** %s\n\n", TaskStatusIcon(t.Status), TaskLabel(*t), truncateRunes(t.Title, 80)))
 	sb.WriteString(fmt.Sprintf("- 状态：%s\n", TaskStatusLabelCN(t.Status)))
 	if t.TaskID != "" {
 		sb.WriteString(fmt.Sprintf("- 全局编号：%s\n", t.TaskID))
