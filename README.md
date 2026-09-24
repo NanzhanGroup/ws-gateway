@@ -27,3 +27,9 @@ import "github.com/NanzhanGroup/ws-gateway"
 - **TempDir / SaveFile** — 临时文件和附件处理
 - **ChatRequest / ChatResponse** — 统一网关通信协议
 - **FileRef** — 文件引用结构（用于附件传递）
+- **任务中枢接入**（`taskhub.go` / `taskcontext.go`）— 活跃任务清单、`#1000 继续#` 指令解析与下发、系统提示注入
+- **内置命令接入**（`wscmd.go`，0.13.0）— 文殊内置命令（`wsc:version` / `wsc:upgrade-module`）的
+  pre-LLM 拦截：`gateway.RunWSCCommand(content)` → `(reply, handled)`，命中即由 ws-core 直接执行、
+  不经 LLM。判定口径与 ws-core 一致；`WS_WSC_CMD=0` 关闭，`WS_CORE_ADDR` 指定中枢地址。
+  各渠道调用位置：紧跟「任务中枢指令（`#1000 继续#`）」之后（weixin/qq/telegram/feishu/wecom 的
+  `process.go`、email 的 `main.go`、device-gateway/server 的 `brain.go`）。
