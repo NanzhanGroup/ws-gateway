@@ -9,7 +9,7 @@ package gateway
 // 智能体只能答"我不知道"，必须先教会用户发井号格式——体验断层。
 //
 // 本文件补上另一半：把【活跃任务摘要】作为**只读引用**注入网关系统提示
-// （各网关 gateway_refs.go 与 SOUL.md / MEMORY.md / USER.md 并列），
+// （各网关 gateway_refs.go 与 SOUL.md / USER.md 并列；MEMORY.md 已废弃不再注入），
 // 于是用户用自然语言问，智能体答得出。这就是 W4 里"替代记忆提炼"的落点：
 // 与其每晚提炼一份会过期的记忆，不如让智能体随时看到**实时任务事实**。
 //
@@ -219,7 +219,7 @@ var taskContextRegistry sync.Map // name -> *TaskContext
 
 // TaskContextRef 各网关一行接入：返回注入正文（空串 = 不注入）。
 //
-// 用法（gateway_refs.go，与 SOUL.md / MEMORY.md / USER.md 并列）：
+// 用法（gateway_refs.go，与 SOUL.md / USER.md 并列；MEMORY.md 已废弃）：
 //
 //	if s := gateway.TaskContextRef("qq"); s != "" {
 //		parts = append(parts, "【任务清单 · ws-core 中枢】\n"+s)
