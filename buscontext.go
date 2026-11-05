@@ -89,7 +89,7 @@ func InvalidateBusUnread(name string) {
 
 func fetchBusUnread() string {
 	client := &http.Client{Timeout: 800 * time.Millisecond}
-	resp, err := client.Get(TaskHubAddrFromEnv() + "/api/bus/inbox?unread_only=1&limit=20")
+	resp, err := client.Get(WSCoreAddrFromEnv() + "/api/bus/inbox?unread_only=1&limit=20")
 	if err != nil {
 		return ""
 	}
